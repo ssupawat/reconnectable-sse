@@ -173,26 +173,3 @@ pod handling phase 2 proves cross-instance resume.
 podman-compose down -v
 ```
 
-## Not covered (intentionally out of scope)
-
-- **CORS** — assumes same-origin
-- **Auth** — `X-Stream-Id` is trusted as-is
-- **Multi-turn conversation** — one request, one stream; new chat = new `X-Stream-Id`
-- **TLS / HTTP/2** — plain HTTP/1.1 via nginx
-- **Browser-side reconnect loop** — the demo is a Go client; a real product writes the JS
-
-## Layout
-
-```
-reconnectable-sse/
-├── podman-compose.yml        # 4 containers: nginx, api-1, api-2, redis
-├── Containerfile             # multi-stage Go build → distroless
-├── go.mod
-├── main.go                   # api server: handler + 2 goroutines
-├── client/
-│   └── main.go               # test client: POST → server drops → POST resume
-├── nginx/
-│   └── default.conf          # round-robin upstream + SSE-safe proxy
-├── Makefile                  # up / down / logs / demo
-└── README.md
-```
