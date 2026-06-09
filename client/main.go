@@ -13,14 +13,14 @@ package main
 
 import (
 	"bufio"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -36,11 +36,6 @@ type sseEvent struct {
 	Data  string
 }
 
-func streamIDFor(body string) string {
-	h := sha256.Sum256([]byte(body))
-	return hex.EncodeToString(h[:])
-}
-
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "ERR:", err)
@@ -49,14 +44,14 @@ func main() {
 }
 
 func run() error {
+	sessionID := uuid.NewString()
 	body := fmt.Sprintf(`{"prompt":%q}`, promptText)
-	expected := streamIDFor(body)
-	fmt.Printf("body              : %s\n", body)
-	fmt.Printf("expected stream_id: %s\n\n", expected)
+	fmt.Printf("session_id : %s\n", sessionID)
+	fmt.Printf("body       : %s\n\n", body)
 
 	// Phase 1: server drops the connection after 3 events.
 	fmt.Println("=== Phase 1: connect (server will drop after 3 events) ===")
-	lastID, err := connect(body, "", dropAfter, true)
+	lastID, err := connect(sessionID, body, "", dropAfter, true)
 	if err != nil {
 		return fmt.Errorf("phase 1: %w", err)
 	}
@@ -68,9 +63,9 @@ func run() error {
 
 	time.Sleep(500 * time.Millisecond)
 
-	// Phase 2: same body, with X-Last-Event-Id, read to done.
-	fmt.Println("\n=== Phase 2: reconnect with same body, read to done ===")
-	if _, err := connect(body, lastID, 1000, false); err != nil {
+	// Phase 2: same session_id, with X-Last-Event-Id, read to done.
+	fmt.Println("\n=== Phase 2: reconnect with same session_id, read to done ===")
+	if _, err := connect(sessionID, body, lastID, 1000, false); err != nil {
 		return fmt.Errorf("phase 2: %w", err)
 	}
 
@@ -81,12 +76,13 @@ func run() error {
 // connect performs one POST, reads SSE events, and returns the last event id
 // read. If expectDrop is true, the server is told to close the connection
 // after maxEvents events; an EOF before `done` is treated as the expected drop.
-func connect(body, lastID string, maxEvents int, expectDrop bool) (string, error) {
+func connect(sessionID, body, lastID string, maxEvents int, expectDrop bool) (string, error) {
 	req, err := http.NewRequest("POST", targetURL, strings.NewReader(body))
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Session-Id", sessionID)
 	if lastID != "" {
 		req.Header.Set("X-Last-Event-Id", lastID)
 	}
