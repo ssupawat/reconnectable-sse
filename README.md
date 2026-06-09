@@ -95,13 +95,6 @@ data: {"reason":"complete"}
 If a resume references a stream that has expired or never existed, the
 server sends `event: error` with `{"error":"stream_not_found"}` and closes.
 
-If a resume references an offset that has been trimmed by `MAXLEN`, the
-server sends `event: error` with `{"error":"events_lost","oldest_id":"...","requested_id":"..."}`
-and closes. This is **unrecoverable** for the lost events — the frontend
-should start a fresh stream (e.g. with a new `X-Session-Id`). With the
-defaults (`MAXLEN=10000`, `TTL=1h`) this should not happen for a
-browser-driven auto-reconnect under normal operation.
-
 > `X-Last-Event-Id` and `X-Session-Id` are custom (no standard auto-reply
 > mechanism) because the standard `Last-Event-ID` header is only auto-sent
 > by the browser's `EventSource` on GET reconnects. With POST the client
