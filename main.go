@@ -41,7 +41,13 @@ const (
 	// streamMaxLen caps the number of entries kept per Redis stream.
 	// Older entries are trimmed at XADD time, so abandoned or fast-generator
 	// streams cannot grow without bound.
-	streamMaxLen = 1000
+	//
+	// Backpressure is intentionally light: this is designed for browser
+	// auto-reconnect, where the window between disconnect and reconnect is
+	// seconds and the buffer is tiny. The 1h TTL + this high MAXLEN give
+	// more than enough headroom; events_lost detection in runSSEResponse
+	// is the final safety net if both somehow fail.
+	streamMaxLen = 10000
 )
 
 var rdb *redis.Client
@@ -195,17 +201,33 @@ func runEventGenerator(ctx context.Context, streamID, prompt string) {
 func runSSEResponse(ctx context.Context, streamID, lastEventID string, dropAfter int, w http.ResponseWriter, flusher http.Flusher) {
 	key := streamKeyPrefix + streamID
 
-	// For resumes, verify the stream still exists. For new requests (lastID=="0")
-	// we skip the check — the stream may not exist yet but XREAD with BLOCK will
-	// wait for the generator's first XADD to create it.
+	// For resumes, verify the stream still exists AND the offset is still
+	// reachable (not trimmed by MAXLEN). For new requests (lastID=="0") we
+	// skip the check — the stream may not exist yet but XREAD with BLOCK
+	// will wait for the generator's first XADD to create it.
 	if lastEventID != "0" {
-		n, err := rdb.Exists(ctx, key).Result()
+		entries, err := rdb.XRangeN(ctx, key, "-", "+", 1).Result()
 		if err != nil {
-			log.Printf("[sse %s] exists check: %v", streamID, err)
+			log.Printf("[sse %s] xrange: %v", streamID, err)
 			return
 		}
-		if n == 0 {
+		if len(entries) == 0 {
 			fmt.Fprintf(w, "event: error\ndata: {\"error\":\"stream_not_found\"}\n\n")
+			flusher.Flush()
+			return
+		}
+		oldestID := entries[0].ID
+		if lastEventID < oldestID {
+			// The offset the client asked for was trimmed by MAXLEN.
+			// Tell the client so it can recover (e.g. restart the stream
+			// from offset 0 with a fresh X-Session-Id, or surface the loss
+			// to the user).
+			errPayload, _ := json.Marshal(map[string]string{
+				"error":        "events_lost",
+				"oldest_id":    oldestID,
+				"requested_id": lastEventID,
+			})
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", errPayload)
 			flusher.Flush()
 			return
 		}
