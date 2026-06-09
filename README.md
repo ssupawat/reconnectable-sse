@@ -16,29 +16,34 @@ abandoned sessions.
 
 ## Design
 
-```
-                                 ┌──────────────────────────────┐
-Client ── POST /v1/stream ──▶   │           nginx              │
-                                 │       (round-robin)          │
-                                 └──────────┬───────────────────┘
-                                            │
-                          ┌─────────────────┴─────────────────┐
-                          ▼                                   ▼
-                   ┌─────────────┐                     ┌─────────────┐
-                   │   api-1     │                     │   api-2     │
-                   │             │                     │             │
-                   │ runSSEResponse   runEventGenerator │ runSSEResponse   runEventGenerator
-                   └──────┬──────┘                     └──────┬──────┘
-                          │         XADD / XREAD            │
-                          └──────────────┬───────────────────┘
-                                         ▼
-                                 ┌───────────────┐
-                                 │     redis     │
-                                 │ sse:stream:*  │
-                                 └───────────────┘
+```mermaid
+flowchart TB
+    C[Client]
+    N[nginx<br/>round-robin]
+    R[(redis<br/>sse:stream:*)]
+
+    C -->|POST /v1/stream| N
+
+    subgraph Pod1 [api-1]
+        S1[runSSEResponse]
+        G1[runEventGenerator]
+    end
+
+    subgraph Pod2 [api-2]
+        S2[runSSEResponse]
+        G2[runEventGenerator]
+    end
+
+    N --> S1
+    N --> S2
+    S1 -->|XREAD| R
+    G1 -->|XADD| R
+    S2 -->|XREAD| R
+    G2 -->|XADD| R
 ```
 
-Per stream, two goroutines run, communicating **only** through Redis:
+Per stream, two goroutines run on the api pod that owns the first
+request, communicating **only** through Redis:
 
 | Goroutine           | Reads from     | Writes to        | Lifetime                  |
 | ------------------- | -------------- | ---------------- | ------------------------- |
@@ -48,6 +53,39 @@ Per stream, two goroutines run, communicating **only** through Redis:
 `runEventGenerator` is detached — a client disconnect never stops the work.
 On a reconnect (any pod), `runSSEResponse` reads from the offset in
 `X-Last-Event-Id` and forwards new events to the client.
+
+### Reconnect flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant N as nginx
+    participant A1 as api-1
+    participant A2 as api-2
+    participant R as redis
+
+    rect rgb(245,245,245)
+    Note over C,R: Phase 1 — first connection
+    C->>N: POST /v1/stream
+    N->>A1: (round-robin)
+    A1->>R: XADD event 1
+    A1->>C: SSE event 1
+    A1->>R: XADD event 2
+    A1->>C: SSE event 2
+    A1->>R: XADD event 3
+    A1->>C: SSE event 3
+    Note over A1,C: client closes (drop)
+    end
+
+    rect rgb(245,245,245)
+    Note over C,R: Phase 2 — reconnect
+    C->>N: POST /v1/stream<br/>(X-Stream-Id + X-Last-Event-Id)
+    N->>A2: (round-robin)
+    A2->>R: XREAD from event 4
+    R-->>A2: events 4..N + done
+    A2->>C: SSE events 4..N + done
+    end
+```
 
 ### Stream identity
 
