@@ -38,6 +38,10 @@ const (
 	heartbeatPeriod = 5 * time.Second
 	tokensPerStream = 20
 	tokenDelay      = 300 * time.Millisecond
+	// streamMaxLen caps the number of entries kept per Redis stream.
+	// Older entries are trimmed at XADD time, so abandoned or fast-generator
+	// streams cannot grow without bound.
+	streamMaxLen = 1000
 )
 
 var rdb *redis.Client
@@ -154,6 +158,8 @@ func runEventGenerator(ctx context.Context, streamID, prompt string) {
 		})
 		if err := rdb.XAdd(ctx, &redis.XAddArgs{
 			Stream: key,
+			MaxLen: streamMaxLen,
+			Approx: true,
 			Values: map[string]any{"event": "token", "data": string(payload)},
 		}).Err(); err != nil {
 			log.Printf("[generator %s] xadd: %v", streamID, err)
@@ -170,6 +176,8 @@ func runEventGenerator(ctx context.Context, streamID, prompt string) {
 
 	if err := rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: key,
+		MaxLen: streamMaxLen,
+		Approx: true,
 		Values: map[string]any{"event": "done", "data": `{"reason":"complete"}`},
 	}).Err(); err != nil {
 		log.Printf("[generator %s] xadd done: %v", streamID, err)
