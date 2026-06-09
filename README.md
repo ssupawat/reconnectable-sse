@@ -76,7 +76,6 @@ existing Redis stream.
 | ------------------- | -------- | ----------------------------------------------------------- |
 | `X-Stream-Id`       | **yes**  | Client-generated stream id (any opaque string)              |
 | `X-Last-Event-Id`   | no       | Resume offset (Redis stream id). Absent → read from start   |
-| `X-Test-Drop-After` | no       | Test only: close the SSE response after N events            |
 
 **Body** is the work payload (chat prompt, messages, anything). It does not
 affect stream identity.
@@ -123,9 +122,8 @@ go run ./client
 
 The demo:
 
-1. Generates a UUID for `X-Stream-Id`, sends a body with
-   `X-Test-Drop-After: 3`, reads events, and waits for the server-initiated
-   close (not a client-initiated close).
+1. Generates a UUID for `X-Stream-Id`, sends a body, reads 3 events,
+   then closes the connection from the client side (simulates a drop).
 2. Sends the **same `X-Stream-Id`** with `X-Last-Event-Id` of the last
    received event, reads events to `done`.
 

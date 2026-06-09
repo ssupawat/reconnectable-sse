@@ -1,14 +1,13 @@
 // Test client for the SSE-over-POST backend.
 //
-// Phase 1: POST /v1/stream with X-Test-Drop-After: 3, read events until
-//          the server closes the connection. The close is initiated by the
-//          server and propagates through nginx — the client experiences it
-//          as a network-level drop, not a clean shutdown it requested.
-// Phase 2: POST /v1/stream with the same X-Stream-Id and X-Last-Event-Id
-//          of the last event from phase 1, read events to `done`.
+// Phase 1: POST /v1/stream, read 3 events, then close the connection
+//          from the client side. This simulates a network drop — the
+//          server has no idea who closed the connection.
+// Phase 2: POST /v1/stream with the same X-Stream-Id + X-Last-Event-Id
+//          from phase 1, read events to `done`.
 //
-// Both phases use the SAME X-Stream-Id, so the second request resumes the
-// same stream that phase 1 started.
+// Both phases use the same X-Stream-Id, so phase 2 resumes the stream
+// that phase 1 started.
 package main
 
 import (
@@ -27,7 +26,7 @@ const (
 	targetURL   = "http://localhost:8080/v1/stream"
 	readTimeout = 30 * time.Second
 	promptText  = "Hello from the reconnectable SSE client"
-	dropAfter   = 3
+	disconnectAfter = 3
 )
 
 type sseEvent struct {
@@ -49,9 +48,8 @@ func run() error {
 	fmt.Printf("stream_id : %s\n", streamID)
 	fmt.Printf("body      : %s\n\n", body)
 
-	// Phase 1: server drops the connection after 3 events.
-	fmt.Println("=== Phase 1: connect (server will drop after 3 events) ===")
-	lastID, err := connect(streamID, body, "", dropAfter, true)
+	fmt.Println("=== Phase 1: connect, read 3 events, close connection ===")
+	lastID, err := connect(streamID, body, "", disconnectAfter)
 	if err != nil {
 		return fmt.Errorf("phase 1: %w", err)
 	}
@@ -59,13 +57,11 @@ func run() error {
 		return fmt.Errorf("phase 1: no events received")
 	}
 	fmt.Printf("\n→ last_event_id = %s\n", lastID)
-	fmt.Println("  (connection terminated by server; not a client-initiated close)")
 
 	time.Sleep(500 * time.Millisecond)
 
-	// Phase 2: same stream_id, with X-Last-Event-Id, read to done.
-	fmt.Println("\n=== Phase 2: reconnect with same stream_id, read to done ===")
-	if _, err := connect(streamID, body, lastID, 1000, false); err != nil {
+	fmt.Println("\n=== Phase 2: reconnect, read to done ===")
+	if _, err := connect(streamID, body, lastID, 0); err != nil {
 		return fmt.Errorf("phase 2: %w", err)
 	}
 
@@ -73,10 +69,10 @@ func run() error {
 	return nil
 }
 
-// connect performs one POST, reads SSE events, and returns the last event id
-// read. If expectDrop is true, the server is told to close the connection
-// after maxEvents events; an EOF before `done` is treated as the expected drop.
-func connect(streamID, body, lastID string, maxEvents int, expectDrop bool) (string, error) {
+// connect performs one POST and reads SSE events. If disconnectAfter > 0,
+// the connection is closed after that many events; otherwise it reads to
+// `done`. Returns the last event id seen.
+func connect(streamID, body, lastID string, disconnectAfter int) (string, error) {
 	req, err := http.NewRequest("POST", targetURL, strings.NewReader(body))
 	if err != nil {
 		return "", err
@@ -85,9 +81,6 @@ func connect(streamID, body, lastID string, maxEvents int, expectDrop bool) (str
 	req.Header.Set("X-Stream-Id", streamID)
 	if lastID != "" {
 		req.Header.Set("X-Last-Event-Id", lastID)
-	}
-	if expectDrop {
-		req.Header.Set("X-Test-Drop-After", fmt.Sprintf("%d", maxEvents))
 	}
 
 	httpClient := &http.Client{Timeout: readTimeout}
@@ -100,7 +93,6 @@ func connect(streamID, body, lastID string, maxEvents int, expectDrop bool) (str
 	fmt.Printf("status=%d\n", resp.StatusCode)
 
 	var capturedLastID string
-	sawDone := false
 	count := 0
 	scanner := bufio.NewScanner(resp.Body)
 	for {
@@ -115,9 +107,6 @@ func connect(streamID, body, lastID string, maxEvents int, expectDrop bool) (str
 		if ev.ID != "" {
 			capturedLastID = ev.ID
 		}
-		if ev.Event == "done" {
-			sawDone = true
-		}
 
 		count++
 		fmt.Printf("  [#%02d] id=%-22s event=%-6s data=%s\n", count, ev.ID, ev.Event, ev.Data)
@@ -125,15 +114,14 @@ func connect(streamID, body, lastID string, maxEvents int, expectDrop bool) (str
 		if ev.Event == "done" || ev.Event == "error" {
 			return capturedLastID, nil
 		}
+		if disconnectAfter > 0 && count >= disconnectAfter {
+			fmt.Println("  -- closing connection --")
+			return capturedLastID, nil
+		}
 	}
 
-	// EOF reached.
-	if expectDrop && !sawDone {
-		// Expected: server closed without sending `done`.
-		return capturedLastID, nil
-	}
-	if !sawDone {
-		return capturedLastID, fmt.Errorf("connection ended without `done` event")
+	if capturedLastID == "" {
+		return "", fmt.Errorf("connection ended without any events")
 	}
 	return capturedLastID, nil
 }

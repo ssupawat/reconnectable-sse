@@ -1,21 +1,13 @@
-package main
+// SSE-over-POST backend. Stream state lives in Redis; any api pod can
+// serve a resume. The two goroutines per stream coordinate through
+// Redis only: runEventGenerator does the work and XADDs events,
+// runSSEResponse XREADs and writes them as SSE.
+//
+// Stream identity is the X-Stream-Id header. Same id + X-Last-Event-Id
+// resumes the stream; same id, no offset, reads from start; different
+// id is a fresh stream.
 
-// SSE-over-POST backend with cross-instance resume via Redis Streams.
-//
-// Per stream two goroutines run, communicating only through Redis:
-//   1. runEventGenerator  — does the "work", XADDs events to the stream
-//   2. runSSEResponse     — XREADs the stream and writes SSE to the client
-//
-// Stream identity comes from the client: each request sends an X-Stream-Id
-// header (client-generated, e.g. a UUID). The server uses it directly as
-// the Redis stream key, so:
-//   - same X-Stream-Id + same X-Last-Event-Id  →  resume
-//   - same X-Stream-Id, no X-Last-Event-Id     →  read from start
-//   - different X-Stream-Id                    →  different stream
-//
-// On client disconnect, runSSEResponse returns. The event generator keeps
-// running under context.Background(), so a reconnect on any instance can
-// resume by reading the same Redis stream at the X-Last-Event-Id offset.
+package main
 
 import (
 	"context"
@@ -25,7 +17,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -58,26 +49,21 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
-	instance := os.Getenv("INSTANCE_ID")
-	log.Printf("api starting instance=%s redis=%s", instance, addr)
+	log.Printf("api starting instance=%s redis=%s", os.Getenv("INSTANCE_ID"), addr)
 	log.Fatal(http.ListenAndServe(":8080", mux))
 }
 
-// handleStream routes the request and starts the two stream goroutines.
-//
-// Headers:
-//   X-Stream-Id         required; client-generated id (e.g. a UUID). Used
-//                       directly as the Redis stream key.
-//   X-Last-Event-Id     resume offset; absent → read from start
-//   X-Test-Drop-After N (test only) close the SSE response after N events
-//                       to simulate a connection drop at the nginx layer
 func handleStream(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
 
-	instance := os.Getenv("INSTANCE_ID")
+	streamID := r.Header.Get("X-Stream-Id")
+	if streamID == "" {
+		http.Error(w, "X-Stream-Id required", http.StatusBadRequest)
+		return
+	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -85,89 +71,47 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Headers must be set before the first Write.
-	h := w.Header()
-	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
-	h.Set("Connection", "keep-alive")
-	h.Set("X-Accel-Buffering", "no")
-
-	streamID := r.Header.Get("X-Stream-Id")
-	if streamID == "" {
-		http.Error(w, "X-Stream-Id required", http.StatusBadRequest)
-		return
-	}
-	key := streamKeyPrefix + streamID
-
-	body, _ := io.ReadAll(r.Body)
+	setSSEHeaders(w)
+	writeMeta(w, flusher, streamID)
 
 	lastEventID := r.Header.Get("X-Last-Event-Id")
 	if lastEventID == "" {
 		lastEventID = "0"
 	}
 
-	dropAfter := 0
-	if v := r.Header.Get("X-Test-Drop-After"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			dropAfter = n
-		}
+	key := streamKeyPrefix + streamID
+	body, _ := io.ReadAll(r.Body)
+
+	// First request for this stream starts the generator; resumes
+	// just read from the existing stream.
+	if !streamExists(r.Context(), key) {
+		go runEventGenerator(streamID, string(body))
 	}
 
-	// First Write triggers 200 OK and flushes the response head.
-	meta := map[string]string{"stream_id": streamID}
-	metaJSON, _ := json.Marshal(meta)
-	fmt.Fprintf(w, "event: meta\ndata: %s\n\n", metaJSON)
-	flusher.Flush()
-
-	// Start the generator only the first time we see this stream id.
-	exists, _ := rdb.Exists(r.Context(), key).Result()
-	if exists == 0 {
-		genCtx, cancelGen := context.WithCancel(context.Background())
-		go func() {
-			defer cancelGen()
-			runEventGenerator(genCtx, streamID, string(body))
-		}()
-		log.Printf("[%s] new stream_id=%s (generator starting)", instance, streamID)
-	} else {
-		log.Printf("[%s] seen stream_id=%s, resuming from %s", instance, streamID, lastEventID)
-	}
-
-	runSSEResponse(r.Context(), streamID, lastEventID, dropAfter, w, flusher)
+	runSSEResponse(r.Context(), streamID, lastEventID, w, flusher)
 }
 
-// runEventGenerator simulates work and XADDs events to the Redis stream.
-func runEventGenerator(ctx context.Context, streamID, prompt string) {
+func runEventGenerator(streamID, prompt string) {
 	key := streamKeyPrefix + streamID
 	tokens := generateTokens(prompt)
 
-	ttlSet := false
 	for i, tok := range tokens {
-		if ctx.Err() != nil {
-			return
-		}
-
-		payload, _ := json.Marshal(map[string]any{
-			"type":  "token",
-			"index": i,
-			"text":  tok,
-		})
-		if err := rdb.XAdd(ctx, &redis.XAddArgs{
+		payload, _ := json.Marshal(map[string]any{"index": i, "text": tok})
+		if err := rdb.XAdd(context.Background(), &redis.XAddArgs{
 			Stream: key,
 			Values: map[string]any{"event": "token", "data": string(payload)},
 		}).Err(); err != nil {
 			log.Printf("[generator %s] xadd: %v", streamID, err)
 			return
 		}
-
-		if !ttlSet {
-			_ = rdb.Expire(ctx, key, streamTTL).Err()
-			ttlSet = true
+		if i == 0 {
+			// Set TTL once the key actually exists.
+			rdb.Expire(context.Background(), key, streamTTL)
 		}
-
 		time.Sleep(tokenDelay)
 	}
 
-	if err := rdb.XAdd(ctx, &redis.XAddArgs{
+	if err := rdb.XAdd(context.Background(), &redis.XAddArgs{
 		Stream: key,
 		Values: map[string]any{"event": "done", "data": `{"reason":"complete"}`},
 	}).Err(); err != nil {
@@ -177,29 +121,14 @@ func runEventGenerator(ctx context.Context, streamID, prompt string) {
 	log.Printf("[generator %s] complete (%d tokens)", streamID, len(tokens))
 }
 
-// runSSEResponse XREADs from the stream and writes SSE events to the client.
-// Exits when:
-//   - a `done` event is sent, OR
-//   - the request context is cancelled (client disconnect), OR
-//   - dropAfter > 0 and that many events have been sent (test drop), OR
-//   - the stream does not exist on a resume (sends `error` then returns).
-func runSSEResponse(ctx context.Context, streamID, lastEventID string, dropAfter int, w http.ResponseWriter, flusher http.Flusher) {
+func runSSEResponse(ctx context.Context, streamID, lastEventID string, w http.ResponseWriter, flusher http.Flusher) {
 	key := streamKeyPrefix + streamID
 
-	// For resumes, verify the stream still exists. For new requests
-	// (lastID=="0") we skip the check — the stream may not exist yet but
-	// XREAD with BLOCK will wait for the generator's first XADD to create it.
-	if lastEventID != "0" {
-		n, err := rdb.Exists(ctx, key).Result()
-		if err != nil {
-			log.Printf("[sse %s] exists check: %v", streamID, err)
-			return
-		}
-		if n == 0 {
-			fmt.Fprintf(w, "event: error\ndata: {\"error\":\"stream_not_found\"}\n\n")
-			flusher.Flush()
-			return
-		}
+	// For resumes, fail fast if the stream has expired. New requests
+	// skip this and rely on XREAD BLOCK to wait for the first XADD.
+	if lastEventID != "0" && !streamExists(ctx, key) {
+		writeError(w, flusher, "stream_not_found")
+		return
 	}
 
 	readID := lastEventID
@@ -207,7 +136,6 @@ func runSSEResponse(ctx context.Context, streamID, lastEventID string, dropAfter
 		readID = "0-0"
 	}
 
-	sent := 0
 	for {
 		streams, err := rdb.XRead(ctx, &redis.XReadArgs{
 			Streams: []string{key, readID},
@@ -216,18 +144,15 @@ func runSSEResponse(ctx context.Context, streamID, lastEventID string, dropAfter
 		}).Result()
 
 		if err == redis.Nil {
-			if _, werr := fmt.Fprintf(w, ": heartbeat\n\n"); werr != nil {
-				return
-			}
-			flusher.Flush()
+			writeHeartbeat(w, flusher)
 			continue
 		}
 		if err != nil {
 			if ctx.Err() != nil {
 				log.Printf("[sse %s] client disconnected", streamID)
-				return
+			} else {
+				log.Printf("[sse %s] xread: %v", streamID, err)
 			}
-			log.Printf("[sse %s] xread: %v", streamID, err)
 			return
 		}
 
@@ -236,18 +161,8 @@ func runSSEResponse(ctx context.Context, streamID, lastEventID string, dropAfter
 				readID = msg.ID
 				evType, _ := msg.Values["event"].(string)
 				data, _ := msg.Values["data"].(string)
-
-				if _, werr := fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", msg.ID, evType, data); werr != nil {
-					return
-				}
-				flusher.Flush()
-				sent++
-
+				writeEvent(w, flusher, msg.ID, evType, data)
 				if evType == "done" {
-					return
-				}
-				if dropAfter > 0 && sent >= dropAfter {
-					log.Printf("[sse %s] test drop after %d events", streamID, sent)
 					return
 				}
 			}
@@ -255,12 +170,46 @@ func runSSEResponse(ctx context.Context, streamID, lastEventID string, dropAfter
 	}
 }
 
+func streamExists(ctx context.Context, key string) bool {
+	n, _ := rdb.Exists(ctx, key).Result()
+	return n > 0
+}
+
+func setSSEHeaders(w http.ResponseWriter) {
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no")
+}
+
+func writeMeta(w http.ResponseWriter, flusher http.Flusher, streamID string) {
+	payload, _ := json.Marshal(map[string]string{"stream_id": streamID})
+	fmt.Fprintf(w, "event: meta\ndata: %s\n\n", payload)
+	flusher.Flush()
+}
+
+func writeEvent(w http.ResponseWriter, flusher http.Flusher, id, event, data string) {
+	fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", id, event, data)
+	flusher.Flush()
+}
+
+func writeHeartbeat(w http.ResponseWriter, flusher http.Flusher) {
+	fmt.Fprintf(w, ": heartbeat\n\n")
+	flusher.Flush()
+}
+
+func writeError(w http.ResponseWriter, flusher http.Flusher, err string) {
+	fmt.Fprintf(w, "event: error\ndata: {\"error\":%q}\n\n", err)
+	flusher.Flush()
+}
+
 func generateTokens(prompt string) []string {
 	base := fmt.Sprintf("You asked: %q. Simulated streaming response, one token at a time.", prompt)
 	words := strings.Fields(base)
-	out := make([]string, 0, tokensPerStream)
-	for i := 0; i < tokensPerStream; i++ {
-		out = append(out, words[i%len(words)])
+	out := make([]string, tokensPerStream)
+	for i := range out {
+		out[i] = words[i%len(words)]
 	}
 	return out
 }
