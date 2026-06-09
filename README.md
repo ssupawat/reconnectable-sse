@@ -2,6 +2,18 @@
 
 Multi-instance SSE-over-POST backend with cross-pod stream resume via Redis Streams.
 
+## What this PoC proves
+
+A browser can lose its SSE connection mid-response and, on retry with the
+same `X-Stream-Id` + last event id, pick up exactly where it left off —
+regardless of which api pod it lands on. State lives in Redis, not in
+process. The two api pods are interchangeable.
+
+Designed for **browser auto-reconnect** (not user-driven "click reconnect"):
+the window between disconnect and reconnect is seconds, the buffer is tiny,
+and the 1h TTL on the Redis key is the only safety net needed for
+abandoned sessions.
+
 ## Design
 
 ```
@@ -15,8 +27,7 @@ Client ── POST /v1/stream ──▶   │           nginx              │
                    ┌─────────────┐                     ┌─────────────┐
                    │   api-1     │                     │   api-2     │
                    │             │                     │             │
-                   │  goroutine 1: runSSEResponse     │  goroutine 1: runSSEResponse
-                   │  goroutine 2: runEventGenerator  │  goroutine 2: runEventGenerator
+                   │ runSSEResponse   runEventGenerator │ runSSEResponse   runEventGenerator
                    └──────┬──────┘                     └──────┬──────┘
                           │         XADD / XREAD            │
                           └──────────────┬───────────────────┘
@@ -27,32 +38,33 @@ Client ── POST /v1/stream ──▶   │           nginx              │
                                  └───────────────┘
 ```
 
-The two goroutines per stream communicate **only** through the Redis stream:
+Per stream, two goroutines run, communicating **only** through Redis:
 
 | Goroutine           | Reads from     | Writes to        | Lifetime                  |
 | ------------------- | -------------- | ---------------- | ------------------------- |
 | `runEventGenerator` | (does the work)| Redis (`XADD`)   | `context.Background()`    |
 | `runSSEResponse`    | Redis (`XREAD`)| HTTP response    | request `context.Context` |
 
-The generator is detached — a client disconnect never stops the work.
+`runEventGenerator` is detached — a client disconnect never stops the work.
+On a reconnect (any pod), `runSSEResponse` reads from the offset in
+`X-Last-Event-Id` and forwards new events to the client.
 
-### Stream identity = client-generated stream id
+### Stream identity
 
-Each request carries an `X-Stream-Id` header (a client-generated id, e.g.
-a UUID). The server uses it directly as the Redis stream key. This decouples
-stream identity from request body — different bodies in the same stream
-resume the same stream, and the same body from two streams stays isolated.
+The client sends an `X-Stream-Id` header (any opaque string, e.g. a UUID).
+The server uses it directly as the Redis stream key.
 
 ```
-X-Stream-Id: a1b2-...       →  redis key sse:stream:a1b2-...
-X-Stream-Id: c3d4-...       →  redis key sse:stream:c3d4-...
+X-Stream-Id: a1b2-...   →  redis key sse:stream:a1b2-...
+X-Stream-Id: c3d4-...   →  redis key sse:stream:c3d4-...
 ```
 
-### Generator lifecycle
+The same `X-Stream-Id` across reconnects resumes the same stream. A
+different `X-Stream-Id` is a different stream, fully isolated.
 
-The first time an api instance sees a given stream id, it starts the
-generator. Subsequent requests (resumes) for the same id do not start a new
-generator — they just consume from the existing Redis stream.
+The generator is started only the first time an api instance sees a given
+`X-Stream-Id`. Resumes on subsequent requests just consume from the
+existing Redis stream.
 
 ## Endpoints
 
@@ -60,17 +72,14 @@ generator — they just consume from the existing Redis stream.
 
 **Headers**
 
-| Header               | Required | Meaning                                                    |
-| -------------------- | -------- | ---------------------------------------------------------- |
-| `X-Stream-Id`        | **yes**  | Client-generated stream id (e.g. a UUID)                    |
-| `X-Last-Event-Id`    | no       | Resume offset (Redis stream id). Absent → read from start  |
-| `X-Test-Drop-After`  | no       | Test only: close the SSE response after N events to        |
-|                      |          | simulate a connection drop at the nginx layer              |
+| Header              | Required | Meaning                                                     |
+| ------------------- | -------- | ----------------------------------------------------------- |
+| `X-Stream-Id`       | **yes**  | Client-generated stream id (any opaque string)              |
+| `X-Last-Event-Id`   | no       | Resume offset (Redis stream id). Absent → read from start   |
+| `X-Test-Drop-After` | no       | Test only: close the SSE response after N events            |
 
-**Body**
-
-The body is opaque to the server; it is the work payload (chat messages,
-prompt, etc.). It does not affect stream identity.
+**Body** is the work payload (chat prompt, messages, anything). It does not
+affect stream identity.
 
 **Response (SSE)**
 
@@ -91,13 +100,14 @@ event: done
 data: {"reason":"complete"}
 ```
 
-If a resume references a stream that has expired or never existed, the
-server sends `event: error` with `{"error":"stream_not_found"}` and closes.
+A resume of a stream that has expired (TTL > 1h) gets
+`event: error` with `{"error":"stream_not_found"}` and the connection
+closes.
 
-> `X-Last-Event-Id` and `X-Stream-Id` are custom (no standard auto-reply
-> mechanism) because the standard `Last-Event-ID` header is only auto-sent
-> by the browser's `EventSource` on GET reconnects. With POST the client
-> must send both explicitly.
+> `X-Stream-Id` and `X-Last-Event-Id` are custom (not the standard
+> `Last-Event-ID`) because the standard header is only auto-sent by the
+> browser's `EventSource` on **GET** reconnects. With **POST** the
+> client code must send both explicitly.
 
 ### `GET /healthz`
 
@@ -119,15 +129,21 @@ The demo:
 2. Sends the **same `X-Stream-Id`** with `X-Last-Event-Id` of the last
    received event, reads events to `done`.
 
-Run `podman-compose logs -f api-1 api-2` in another terminal to see which
-pod handled each phase — a different pod for phase 2 proves cross-instance
-resume.
-
-## Cleanup
+In another terminal, `podman-compose logs -f api-1 api-2` — a different
+pod handling phase 2 proves cross-instance resume.
 
 ```bash
+# tear down
 podman-compose down -v
 ```
+
+## Not covered (intentionally out of scope)
+
+- **CORS** — assumes same-origin
+- **Auth** — `X-Stream-Id` is trusted as-is
+- **Multi-turn conversation** — one request, one stream; new chat = new `X-Stream-Id`
+- **TLS / HTTP/2** — plain HTTP/1.1 via nginx
+- **Browser-side reconnect loop** — the demo is a Go client; a real product writes the JS
 
 ## Layout
 
@@ -138,8 +154,9 @@ reconnectable-sse/
 ├── go.mod
 ├── main.go                   # api server: handler + 2 goroutines
 ├── client/
-│   └── main.go               # test client (POST → server drops → POST resume)
+│   └── main.go               # test client: POST → server drops → POST resume
 ├── nginx/
 │   └── default.conf          # round-robin upstream + SSE-safe proxy
+├── Makefile                  # up / down / logs / demo
 └── README.md
 ```
