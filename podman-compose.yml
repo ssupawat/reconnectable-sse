@@ -1,0 +1,54 @@
+services:
+  nginx:
+    image: docker.io/library/nginx:1.27-alpine
+    container_name: rsse-nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - api-1
+      - api-2
+    networks:
+      - rsse-net
+    restart: unless-stopped
+
+  api-1:
+    build:
+      context: .
+      dockerfile: Containerfile
+    container_name: rsse-api-1
+    environment:
+      - REDIS_ADDR=redis:6379
+      - INSTANCE_ID=api-1
+    depends_on:
+      - redis
+    networks:
+      - rsse-net
+    restart: unless-stopped
+
+  api-2:
+    build:
+      context: .
+      dockerfile: Containerfile
+    container_name: rsse-api-2
+    environment:
+      - REDIS_ADDR=redis:6379
+      - INSTANCE_ID=api-2
+    depends_on:
+      - redis
+    networks:
+      - rsse-net
+    restart: unless-stopped
+
+  redis:
+    image: docker.io/library/redis:7-alpine
+    container_name: rsse-redis
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    networks:
+      - rsse-net
+    restart: unless-stopped
+
+networks:
+  rsse-net:
+    driver: bridge
