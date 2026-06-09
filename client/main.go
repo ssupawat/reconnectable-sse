@@ -4,11 +4,11 @@
 //          the server closes the connection. The close is initiated by the
 //          server and propagates through nginx — the client experiences it
 //          as a network-level drop, not a clean shutdown it requested.
-// Phase 2: POST /v1/stream with the same body and X-Last-Event-Id of the
-//          last event from phase 1, read events to `done`.
+// Phase 2: POST /v1/stream with the same X-Stream-Id and X-Last-Event-Id
+//          of the last event from phase 1, read events to `done`.
 //
-// Both phases use the SAME body. The server derives stream_id = sha256(body),
-// so the second request resumes the same stream that phase 1 started.
+// Both phases use the SAME X-Stream-Id, so the second request resumes the
+// same stream that phase 1 started.
 package main
 
 import (
@@ -44,14 +44,14 @@ func main() {
 }
 
 func run() error {
-	sessionID := uuid.NewString()
+	streamID := uuid.NewString()
 	body := fmt.Sprintf(`{"prompt":%q}`, promptText)
-	fmt.Printf("session_id : %s\n", sessionID)
-	fmt.Printf("body       : %s\n\n", body)
+	fmt.Printf("stream_id : %s\n", streamID)
+	fmt.Printf("body      : %s\n\n", body)
 
 	// Phase 1: server drops the connection after 3 events.
 	fmt.Println("=== Phase 1: connect (server will drop after 3 events) ===")
-	lastID, err := connect(sessionID, body, "", dropAfter, true)
+	lastID, err := connect(streamID, body, "", dropAfter, true)
 	if err != nil {
 		return fmt.Errorf("phase 1: %w", err)
 	}
@@ -63,9 +63,9 @@ func run() error {
 
 	time.Sleep(500 * time.Millisecond)
 
-	// Phase 2: same session_id, with X-Last-Event-Id, read to done.
-	fmt.Println("\n=== Phase 2: reconnect with same session_id, read to done ===")
-	if _, err := connect(sessionID, body, lastID, 1000, false); err != nil {
+	// Phase 2: same stream_id, with X-Last-Event-Id, read to done.
+	fmt.Println("\n=== Phase 2: reconnect with same stream_id, read to done ===")
+	if _, err := connect(streamID, body, lastID, 1000, false); err != nil {
 		return fmt.Errorf("phase 2: %w", err)
 	}
 
@@ -76,13 +76,13 @@ func run() error {
 // connect performs one POST, reads SSE events, and returns the last event id
 // read. If expectDrop is true, the server is told to close the connection
 // after maxEvents events; an EOF before `done` is treated as the expected drop.
-func connect(sessionID, body, lastID string, maxEvents int, expectDrop bool) (string, error) {
+func connect(streamID, body, lastID string, maxEvents int, expectDrop bool) (string, error) {
 	req, err := http.NewRequest("POST", targetURL, strings.NewReader(body))
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Session-Id", sessionID)
+	req.Header.Set("X-Stream-Id", streamID)
 	if lastID != "" {
 		req.Header.Set("X-Last-Event-Id", lastID)
 	}

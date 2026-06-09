@@ -36,17 +36,16 @@ The two goroutines per stream communicate **only** through the Redis stream:
 
 The generator is detached — a client disconnect never stops the work.
 
-### Stream identity = client-generated session id
+### Stream identity = client-generated stream id
 
-Each request carries an `X-Session-Id` header (the client's chat session id,
-typically the user id from auth). The server uses it directly as the Redis
-stream key. This decouples stream identity from request body — different
-bodies in the same session resume the same stream, and the same body from
-two sessions stays isolated.
+Each request carries an `X-Stream-Id` header (a client-generated id, e.g.
+a UUID). The server uses it directly as the Redis stream key. This decouples
+stream identity from request body — different bodies in the same stream
+resume the same stream, and the same body from two streams stays isolated.
 
 ```
-X-Session-Id: user-42       →  redis key sse:stream:user-42
-X-Session-Id: user-43       →  redis key sse:stream:user-43
+X-Stream-Id: a1b2-...       →  redis key sse:stream:a1b2-...
+X-Stream-Id: c3d4-...       →  redis key sse:stream:c3d4-...
 ```
 
 ### Generator lifecycle
@@ -63,7 +62,7 @@ generator — they just consume from the existing Redis stream.
 
 | Header               | Required | Meaning                                                    |
 | -------------------- | -------- | ---------------------------------------------------------- |
-| `X-Session-Id`       | **yes**  | Client-generated session id (e.g. user id from auth)        |
+| `X-Stream-Id`        | **yes**  | Client-generated stream id (e.g. a UUID)                    |
 | `X-Last-Event-Id`    | no       | Resume offset (Redis stream id). Absent → read from start  |
 | `X-Test-Drop-After`  | no       | Test only: close the SSE response after N events to        |
 |                      |          | simulate a connection drop at the nginx layer              |
@@ -77,7 +76,7 @@ prompt, etc.). It does not affect stream identity.
 
 ```
 event: meta
-data: {"session_id":"<echoes X-Session-Id>"}
+data: {"stream_id":"<echoes X-Stream-Id>"}
 
 event: token
 data: {"type":"token","index":0,"text":"You"}
@@ -95,7 +94,7 @@ data: {"reason":"complete"}
 If a resume references a stream that has expired or never existed, the
 server sends `event: error` with `{"error":"stream_not_found"}` and closes.
 
-> `X-Last-Event-Id` and `X-Session-Id` are custom (no standard auto-reply
+> `X-Last-Event-Id` and `X-Stream-Id` are custom (no standard auto-reply
 > mechanism) because the standard `Last-Event-ID` header is only auto-sent
 > by the browser's `EventSource` on GET reconnects. With POST the client
 > must send both explicitly.
@@ -114,10 +113,10 @@ go run ./client
 
 The demo:
 
-1. Generates a UUID for `X-Session-Id`, sends a body with
+1. Generates a UUID for `X-Stream-Id`, sends a body with
    `X-Test-Drop-After: 3`, reads events, and waits for the server-initiated
    close (not a client-initiated close).
-2. Sends the **same `X-Session-Id`** with `X-Last-Event-Id` of the last
+2. Sends the **same `X-Stream-Id`** with `X-Last-Event-Id` of the last
    received event, reads events to `done`.
 
 Run `podman-compose logs -f api-1 api-2` in another terminal to see which

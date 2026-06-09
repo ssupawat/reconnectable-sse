@@ -6,12 +6,12 @@ package main
 //   1. runEventGenerator  — does the "work", XADDs events to the stream
 //   2. runSSEResponse     — XREADs the stream and writes SSE to the client
 //
-// Stream identity comes from the client: each chat session sends an
-// X-Session-Id header (typically the user/session id from auth). The server
-// uses it directly as the Redis stream key, so:
-//   - same X-Session-Id + same X-Last-Event-Id  →  resume
-//   - same X-Session-Id, no X-Last-Event-Id     →  read from start
-//   - different X-Session-Id                    →  different stream
+// Stream identity comes from the client: each request sends an X-Stream-Id
+// header (client-generated, e.g. a UUID). The server uses it directly as
+// the Redis stream key, so:
+//   - same X-Stream-Id + same X-Last-Event-Id  →  resume
+//   - same X-Stream-Id, no X-Last-Event-Id     →  read from start
+//   - different X-Stream-Id                    →  different stream
 //
 // On client disconnect, runSSEResponse returns. The event generator keeps
 // running under context.Background(), so a reconnect on any instance can
@@ -66,8 +66,8 @@ func main() {
 // handleStream routes the request and starts the two stream goroutines.
 //
 // Headers:
-//   X-Session-Id        required; client-generated session id (e.g. user id
-//                       from auth). Used directly as the Redis stream key.
+//   X-Stream-Id         required; client-generated id (e.g. a UUID). Used
+//                       directly as the Redis stream key.
 //   X-Last-Event-Id     resume offset; absent → read from start
 //   X-Test-Drop-After N (test only) close the SSE response after N events
 //                       to simulate a connection drop at the nginx layer
@@ -92,12 +92,11 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
 
-	sessionID := r.Header.Get("X-Session-Id")
-	if sessionID == "" {
-		http.Error(w, "X-Session-Id required", http.StatusBadRequest)
+	streamID := r.Header.Get("X-Stream-Id")
+	if streamID == "" {
+		http.Error(w, "X-Stream-Id required", http.StatusBadRequest)
 		return
 	}
-	streamID := sessionID
 	key := streamKeyPrefix + streamID
 
 	body, _ := io.ReadAll(r.Body)
@@ -115,7 +114,7 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// First Write triggers 200 OK and flushes the response head.
-	meta := map[string]string{"session_id": sessionID}
+	meta := map[string]string{"stream_id": streamID}
 	metaJSON, _ := json.Marshal(meta)
 	fmt.Fprintf(w, "event: meta\ndata: %s\n\n", metaJSON)
 	flusher.Flush()
@@ -128,9 +127,9 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 			defer cancelGen()
 			runEventGenerator(genCtx, streamID, string(body))
 		}()
-		log.Printf("[%s] new session_id=%s (generator starting)", instance, streamID)
+		log.Printf("[%s] new stream_id=%s (generator starting)", instance, streamID)
 	} else {
-		log.Printf("[%s] seen session_id=%s, resuming from %s", instance, streamID, lastEventID)
+		log.Printf("[%s] seen stream_id=%s, resuming from %s", instance, streamID, lastEventID)
 	}
 
 	runSSEResponse(r.Context(), streamID, lastEventID, dropAfter, w, flusher)
